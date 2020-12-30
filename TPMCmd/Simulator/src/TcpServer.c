@@ -48,6 +48,9 @@
 #   include <winsock.h>
 #   pragma warning(pop)
     typedef int socklen_t;
+#   pragma warning(disable: 4255)
+#   include <tbs.h>
+
 #elif defined(__unix__)
 #   include <string.h>
 #   include <unistd.h>
@@ -651,6 +654,95 @@ WriteVarBytes(
     return true;
 }
 
+static const char* get_tbsi_error_msg(TBS_RESULT tbs_res)
+{
+    switch (tbs_res)
+    {
+    case TBS_SUCCESS:
+        return "The function was successful";
+
+    case TBS_E_BAD_PARAMETER:
+        return "One or more parameter values are not valid.";
+
+    case TBS_E_INTERNAL_ERROR:
+        return "An internal software error occurred.";
+
+    case TBS_E_INVALID_CONTEXT_PARAM:
+        return "A context parameter that is not valid was passed when attempting to create a TBS context.";
+
+    case TBS_E_INVALID_CONTEXT:
+        return "The specified context handle does not refer to a valid context.";
+
+    case TBS_E_INVALID_OUTPUT_POINTER:
+        return "A specified output pointer is not valid.";
+
+    case TBS_E_BUFFER_TOO_LARGE:
+        return "The input or output buffer is too large.";
+
+    case TBS_E_SERVICE_DISABLED:
+        return "The TBS service has been disabled.";
+
+    case TBS_E_SERVICE_NOT_RUNNING:
+        return "The TBS service is not running and could not be started.";
+
+    case TBS_E_SERVICE_START_PENDING:
+        return "The TBS service has been started but is not yet running.";
+
+    case TBS_E_TOO_MANY_TBS_CONTEXTS:
+        return "A new context could not be created because there are too many open contexts.";
+
+    case TBS_E_INSUFFICIENT_BUFFER:
+        return "The specified output buffer is too small.";
+
+    case TBS_E_TPM_NOT_FOUND:
+        return "A compatible Trusted Platform Module (TPM) Security Device cannot be found on this computer.";
+
+    case TBS_E_IOERROR:
+        return "An error occurred while communicating with the TPM.";
+
+    }
+    return "Unknown tbsi error found";
+}
+
+static void cleanup_memory(TBS_HCONTEXT tbs_context)
+{
+    if (tbs_context != NULL)
+    {
+        (void)Tbsip_Context_Close(tbs_context);
+    }
+}
+
+TBS_HCONTEXT g_tbs_context;
+
+void CreateTPM()
+{
+    TBS_RESULT tbs_res;
+    TBS_CONTEXT_PARAMS2 parms = { TBS_CONTEXT_VERSION_TWO };
+    TPM_DEVICE_INFO device_info = { 1, 0 };
+
+    parms.includeTpm20 = TRUE;
+
+    tbs_res = Tbsi_Context_Create((PCTBS_CONTEXT_PARAMS)&parms, &g_tbs_context);
+    if (tbs_res != TBS_SUCCESS)
+    {
+        //LogError("Failure: Tbsi_Context_Create %s.", get_tbsi_error_msg(tbs_res));
+    }
+    else
+    {
+        tbs_res = Tbsi_GetDeviceInfo(sizeof(device_info), &device_info);
+        if (tbs_res != TBS_SUCCESS)
+        {
+            //LogError("Failure getting device tpm information %s.", get_tbsi_error_msg(tbs_res));
+            cleanup_memory(g_tbs_context);
+        }
+        else if (device_info.tpmVersion != TPM_VERSION_20)
+        {
+            //LogError("Failure Invalid tpm version specified.  Requires 2.0.");
+            cleanup_memory(g_tbs_context);
+        }
+    }
+}
+
 //*** TpmServer()
 // Processing incoming TPM command requests using the protocol / interface
 // defined above.
@@ -721,6 +813,24 @@ TpmServer(
                     memcpy(&CommandResponseSizes.largestResponse,
                            &OutputBuffer[6], sizeof(uint32_t));
                 }
+
+                InBuffer.Buffer = (uint8_t*)InputBuffer;
+                InBuffer.BufferSize = length;
+                OutBuffer.BufferSize = MAX_BUFFER;
+                OutBuffer.Buffer = (_OUTPUT_BUFFER)OutputBuffer;
+                TBS_RESULT tbs_res;
+                tbs_res = Tbsip_Submit_Command(g_tbs_context, TBS_COMMAND_LOCALITY_ZERO, TBS_COMMAND_PRIORITY_NORMAL,
+                    InBuffer.Buffer, InBuffer.BufferSize, OutBuffer.Buffer, &OutBuffer.BufferSize);
+                if (tbs_res != TBS_SUCCESS)
+                {
+                    //LogError("Failure sending command to tpm %s.", get_tbsi_error_msg(tbs_res));
+                    //result = MU_FAILURE;
+                }
+                else
+                {
+                    //result = 0;
+                }
+
                 OK = WriteVarBytes(s,
                                    (char*)OutBuffer.Buffer,
                                    OutBuffer.BufferSize);
@@ -739,6 +849,7 @@ TpmServer(
                 OK &= WriteUINT32(s, ServerVersion);
                 OK &= WriteUINT32(s, tpmInRawMode 
                                   | tpmPlatformAvailable | tpmSupportsPP);
+                CreateTPM();
                 break;
             case TPM_SET_ALTERNATIVE_RESULT:
                 OK = ReadBytes(s, (char*)&result, 4);
@@ -748,6 +859,11 @@ TpmServer(
                 break;
             case TPM_SESSION_END:
                 // Client signaled end-of-session
+                if (g_tbs_context != NULL)
+                {
+                    cleanup_memory(g_tbs_context);
+                    g_tbs_context = NULL;
+                }
                 return true;
             case TPM_STOP:
                 // Client requested the simulator to exit
